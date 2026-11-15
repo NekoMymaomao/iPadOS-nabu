@@ -77,6 +77,10 @@ the SHNGROOT header on the medium is never read or written through this path.
 | `tools/gen_gpt.py` | Python reference implementation + independent read-back assertions |
 | `tests/test_disk_map.cpp` | blob structure, CRCs, routing, contiguity |
 | `tests/test_disk_core.cpp` | read/write semantics against a fake transport |
+| `kext/NabuSystemDiskKmod.cpp` | `_kmod_info` + `KMOD_EXPLICIT_DECL(org.nabu.driver.SystemDisk)` |
+| `kext/build_nabu_system_disk.py` | macOS kext compile (same flags as the DataBlock build) |
+| `kext/link_nabu_data_block.parameterize.patch` | turns the prelink tool's hardcoded bundle metadata into flags |
+| `kext/README.md` | compile → parameterise → prelink, verbatim commands |
 | `ci/nabu-system-disk.yml` | GitHub Actions: `make check` on every push (copy to `.github/workflows/` at repo root) |
 
 ## Verification
@@ -103,7 +107,7 @@ call.
    `nabu-system-disk=0`.
 3. `NabuSystemDisk.cpp` mirrors the override set of `NabuDataBlock.cpp` but must
    be compiled against the 8796 XNU headers; only the IOKit-free core is covered
-   by the host tests here.
+   by the host tests here. `kext/README.md` has the compile and prelink commands.
 
 ## Known limits
 
