@@ -19,11 +19,20 @@
 // Nothing here writes to the medium.  LBA 0..33 and the last 33 LBAs are
 // synthesised in RAM from NabuGpt.h, so the SHNGROOT header, the official
 // root header and every flashed byte are untouched; the table is a *view*.
+//
+// ABI note
+// --------
+// This translation unit exports `nabu_data_block_start`, the symbol
+// NabuDataKmod.cpp calls and the bundle NabuNativeApfs.c loads by id
+// (`org.nabu.driver.DataBlock`).  Keeping both names means the change is a
+// pure object swap: no new kmod, no bundle rename, nothing else relinked.
 #include <IOKit/IOLib.h>
 #include <IOKit/IODeviceTreeSupport.h>
 #include <IOKit/storage/IOBlockStorageDevice.h>
+#include <libkern/c++/OSData.h>
 #include <libkern/c++/OSDictionary.h>
 #include <libkern/c++/OSString.h>
+#include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
 #include <sys/errno.h>
 
@@ -31,13 +40,23 @@
 #include "NabuStorageApi.h"
 #include "NabuSystemDisk.h"
 
+// The routing engine is small and deliberately IOKit-free.  Compiling it into
+// this translation unit keeps the drop-in swap to a single object: the prelink
+// list replaces NabuDataBlock.o with NabuSystemDisk.o and nothing else moves.
+#include "NabuDiskCore.cpp"
+
 class NabuSystemDisk : public IOBlockStorageDevice {
     OSDeclareDefaultStructors(NabuSystemDisk)
 
     static constexpr unsigned kTransferBytes = 128 * 1024;
     IOLock *gate = nullptr;
     uint8_t *bounce = nullptr;
+    // QEMU passes the Data image in RAM; on hardware everything goes through
+    // the transport and this stays null.
+    uint8_t *memory = nullptr;
+    uint64_t bytes = 0;
     nabu::Disk disk = {};
+    bool logical = false;
     uint64_t writeCalls = 0, writtenBytes = 0, refusedCalls = 0;
 
     static int transportRead(void *, unsigned window, uint64_t offset, void *out, size_t bytes)
@@ -65,14 +84,17 @@ public:
     IOReturn doFormatMedia(UInt64) override { return kIOReturnUnsupported; }
     UInt32 doGetFormatCapacities(UInt64 *, UInt32) const override { return 0; }
     char *getVendorString() override { return const_cast<char *>("UniXNU"); }
-    char *getProductString() override { return const_cast<char *>("Nabu System Disk"); }
+    char *getProductString() override
+        { return const_cast<char *>(logical ? "Nabu System Disk" : "APFS Data"); }
     char *getRevisionString() override { return const_cast<char *>("1.0"); }
-    char *getAdditionalDeviceInfoString() override
-        { return const_cast<char *>("60 GiB nabu_system, synthetic GPT"); }
+    char *getAdditionalDeviceInfoString() override {
+        return const_cast<char *>(memory ? "QEMU Data image"
+                                         : "60 GiB nabu_system, synthetic GPT");
+    }
     IOReturn reportBlockSize(UInt64 *value) override
         { *value = nabu::kLogicalSector; return kIOReturnSuccess; }
     IOReturn reportMaxValidBlock(UInt64 *value) override
-        { *value = nabu::kTotalLba - 1; return kIOReturnSuccess; }
+        { *value = bytes / nabu::kLogicalSector - 1; return kIOReturnSuccess; }
     IOReturn reportEjectability(bool *value) override
         { *value = false; return kIOReturnSuccess; }
     IOReturn reportRemovability(bool *value) override
@@ -98,29 +120,49 @@ bool NabuSystemDisk::start(IOService *provider)
 {
     if (!IOBlockStorageDevice::start(provider)) return false;
 
-    // `nabu-system-disk=0` keeps the old window-only behaviour for A/B boots.
-    uint32_t enabled = 1;
-    PE_parse_boot_argn("nabu-system-disk", &enabled, sizeof(enabled));
-    if (enabled != 1) {
-        IOLog("NABU SYSTEM DISK: disabled by boot arg\n");
-        return false;
+    // The QEMU loader owns this RAM allocation for the whole boot.  There the
+    // image *is* the backing store, so publish it alone, exactly as before.
+    IORegistryEntry *map = IORegistryEntry::fromPath("/chosen/memory-map", gIODTPlane);
+    if (map) {
+        OSData *range = OSDynamicCast(OSData, map->getProperty("NabuDataDisk"));
+        if (range) {
+            uint64_t physical;
+            memcpy(&physical, range->getBytesNoCopy(), sizeof(physical));
+            memcpy(&bytes, static_cast<const uint8_t *>(range->getBytesNoCopy()) + 8,
+                   sizeof(bytes));
+            memory = reinterpret_cast<uint8_t *>(ml_static_ptovirt(physical));
+        }
+        map->release();
     }
 
-    // nabu_storage_prepare() may already have run for the OS/SystemOS
-    // validation pass; in that case only insist that the transport is live.
-    if (nabu_storage_prepare() && !nabu_storage_size(2)) {
-        IOLog("NABU SYSTEM DISK: storage layering refused\n");
-        return false;
-    }
-    // Refuse to invent a geometry the transport does not actually have.
-    for (unsigned i = 0; i < 3; ++i) {
-        const uint64_t size = nabu_storage_size(nabu::kWindows[i].index);
-        if (size != nabu::kWindows[i].bytes) {
-            IOLog("NABU SYSTEM DISK: window %u is %llu bytes, expected %llu\n", i,
-                  static_cast<unsigned long long>(size),
-                  static_cast<unsigned long long>(nabu::kWindows[i].bytes));
+    if (memory) {
+        logical = false;
+    } else {
+        // `nabu-system-disk=0` keeps the old window-only behaviour for A/B.
+        uint32_t enabled = 1;
+        PE_parse_boot_argn("nabu-system-disk", &enabled, sizeof(enabled));
+        if (enabled != 1) {
+            IOLog("NABU SYSTEM DISK: disabled by boot arg\n");
             return false;
         }
+        // nabu_storage_prepare() may already have run for the OS/SystemOS
+        // validation pass; in that case only insist that the transport is live.
+        if (nabu_storage_prepare() && !nabu_storage_size(2)) {
+            IOLog("NABU SYSTEM DISK: storage layering refused\n");
+            return false;
+        }
+        // Refuse to invent a geometry the transport does not actually have.
+        for (unsigned i = 0; i < 3; ++i) {
+            const uint64_t size = nabu_storage_size(nabu::kWindows[i].index);
+            if (size != nabu::kWindows[i].bytes) {
+                IOLog("NABU SYSTEM DISK: window %u is %llu bytes, expected %llu\n", i,
+                      static_cast<unsigned long long>(size),
+                      static_cast<unsigned long long>(nabu::kWindows[i].bytes));
+                return false;
+            }
+        }
+        logical = true;
+        bytes = nabu::kPartitionBytes;
     }
 
     bounce = static_cast<uint8_t *>(IOMalloc(kTransferBytes));
@@ -128,27 +170,37 @@ bool NabuSystemDisk::start(IOService *provider)
     gate = IOLockAlloc();
     if (!gate) return false;
 
-    nabu::Backend backend = {this, transportRead, transportWrite};
-    if (!disk.init(backend)) return false;
+    if (logical) {
+        nabu::Backend backend = {this, transportRead, transportWrite};
+        if (!disk.init(backend)) return false;
+    }
 
     OSDictionary *protocol = OSDictionary::withCapacity(2);
     OSString *type = OSString::withCString(kIOPropertyPhysicalInterconnectTypeVirtual);
-    OSString *location = OSString::withCString(kIOPropertyInternalKey);
+    OSString *location = OSString::withCString(
+        memory ? kIOPropertyInterconnectRAMKey : kIOPropertyInternalKey);
     protocol->setObject(kIOPropertyPhysicalInterconnectTypeKey, type);
     protocol->setObject(kIOPropertyPhysicalInterconnectLocationKey, location);
     setProperty(kIOPropertyProtocolCharacteristicsKey, protocol);
     type->release(); location->release(); protocol->release();
-    setName("NabuSystemDisk");
+    setName("NabuDataBlock");
 
-    IOLog("NABU SYSTEM DISK: 60 GiB, %llu LBAs of %u, GPT %u bytes\n",
-          static_cast<unsigned long long>(nabu::kTotalLba), nabu::kLogicalSector,
-          static_cast<unsigned>(nabu::kMetaBytes));
-    for (unsigned i = 0; i < 4; ++i)
-        IOLog("NABU SYSTEM DISK: %-12s LBA %10llu..%10llu %s\n", nabu::kRegions[i].name,
-              static_cast<unsigned long long>(nabu::kRegions[i].offset / nabu::kLogicalSector),
-              static_cast<unsigned long long>((nabu::kRegions[i].offset +
-                  nabu::kRegions[i].bytes) / nabu::kLogicalSector - 1),
-              i == 2 ? "rw" : "ro");
+    if (!logical) {
+        IOLog("NABU DATA BLOCK: QEMU RAM bytes=%llu logical-block=%u\n",
+              static_cast<unsigned long long>(bytes), nabu::kLogicalSector);
+    } else {
+        IOLog("NABU SYSTEM DISK: %llu bytes, %llu LBAs of %u, GPT %u bytes\n",
+              static_cast<unsigned long long>(bytes),
+              static_cast<unsigned long long>(nabu::kTotalLba), nabu::kLogicalSector,
+              static_cast<unsigned>(nabu::kMetaBytes));
+        for (unsigned i = 0; i < 4; ++i)
+            IOLog("NABU SYSTEM DISK: %-12s LBA %10llu..%10llu %s\n", nabu::kRegions[i].name,
+                  static_cast<unsigned long long>(nabu::kRegions[i].offset /
+                                                  nabu::kLogicalSector),
+                  static_cast<unsigned long long>((nabu::kRegions[i].offset +
+                      nabu::kRegions[i].bytes) / nabu::kLogicalSector - 1),
+                  i == 2 ? "rw" : "ro");
+    }
     registerService();
     return true;
 }
@@ -156,7 +208,8 @@ bool NabuSystemDisk::start(IOService *provider)
 IOReturn NabuSystemDisk::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 block,
     UInt64 count, IOStorageAttributes *, IOStorageCompletion *completion)
 {
-    if (block > nabu::kTotalLba || count > nabu::kTotalLba - block)
+    if (block > bytes / nabu::kLogicalSector ||
+        count > bytes / nabu::kLogicalSector - block)
         return kIOReturnBadArgument;
     const uint64_t length = count * nabu::kLogicalSector;
     const uint64_t offset = block * nabu::kLogicalSector;
@@ -165,22 +218,29 @@ IOReturn NabuSystemDisk::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 blo
     uint64_t done = 0;
     IOReturn status = kIOReturnSuccess;
     IOLockLock(gate);
-    while (done < length) {
-        const uint64_t take = length - done < kTransferBytes ? length - done : kTransferBytes;
-        int error;
-        if (write) {
-            if (buffer->readBytes(done, bounce, static_cast<IOByteCount>(take)) != take) {
-                error = EFAULT;
+    if (!logical) {
+        // QEMU RAM image: one straight copy, no routing.
+        done = write ? buffer->readBytes(0, memory + offset, static_cast<IOByteCount>(length))
+                     : buffer->writeBytes(0, memory + offset, static_cast<IOByteCount>(length));
+        if (done != length) status = kIOReturnIOError;
+    } else {
+        while (done < length) {
+            const uint64_t take = length - done < kTransferBytes ? length - done : kTransferBytes;
+            int error;
+            if (write) {
+                if (buffer->readBytes(done, bounce, static_cast<IOByteCount>(take)) != take) {
+                    error = EFAULT;
+                } else {
+                    error = disk.write(offset + done, bounce, static_cast<size_t>(take));
+                }
             } else {
-                error = disk.write(offset + done, bounce, static_cast<size_t>(take));
+                error = disk.read(offset + done, bounce, static_cast<size_t>(take));
+                if (!error && buffer->writeBytes(done, bounce, static_cast<IOByteCount>(take)) != take)
+                    error = EFAULT;
             }
-        } else {
-            error = disk.read(offset + done, bounce, static_cast<size_t>(take));
-            if (!error && buffer->writeBytes(done, bounce, static_cast<IOByteCount>(take)) != take)
-                error = EFAULT;
+            if (error) { status = kIOReturnIOError; break; }
+            done += take;
         }
-        if (error) { status = kIOReturnIOError; break; }
-        done += take;
     }
     if (write) {
         ++writeCalls;
@@ -198,7 +258,7 @@ IOReturn NabuSystemDisk::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 blo
 IOReturn NabuSystemDisk::doSynchronizeCache()
 {
     IOLockLock(gate);
-    const int error = nabu_storage_sync(2);
+    const int error = logical ? nabu_storage_sync(2) : 0;
     IOLog("NABU SYSTEM IO: sync writes=%llu bytes=%llu refused=%llu errno=%d\n",
           writeCalls, writtenBytes, refusedCalls, error);
     IOLockUnlock(gate);
@@ -212,7 +272,20 @@ void NabuSystemDisk::free()
     IOBlockStorageDevice::free();
 }
 
-extern "C" int nabu_system_disk_start(void)
+#if defined(NABU_HOST_BUILD)
+// The Darwin kext toolchain emits no C++ atexit registration for this
+// translation unit.  Host clang does, so define the two inert symbols here --
+// only under an explicit host-build macro -- to keep the prelink graph closed
+// while validating the object swap on Linux.  Never defined for the real kext.
+extern "C" {
+void *__dso_handle = nullptr;
+int __cxa_atexit(void (*)(void *), void *, void *) { return 0; }
+}
+#endif
+
+// Same symbol NabuDataKmod.cpp calls, so this object drops into the existing
+// kext without touching the kmod or the bundle id.
+extern "C" int nabu_data_block_start(void)
 {
     NabuSystemDisk *device = new NabuSystemDisk;
     if (!device) return ENOMEM;
