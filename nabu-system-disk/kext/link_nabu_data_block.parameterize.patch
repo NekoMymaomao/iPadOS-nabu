@@ -1,0 +1,84 @@
+--- orig.py	2026-11-15 12:07:59.606849493 +0800
++++ work.py	2026-11-15 12:07:59.644849359 +0800
+@@ -16,6 +16,9 @@
+ COALESCED = {'__TEXT': '__PRELINK_TEXT', '__TEXT_EXEC': '__PLK_TEXT_EXEC',
+              '__DATA_CONST': '__PLK_DATA_CONST', '__DATA': '__PRELINK_DATA'}
+ BUNDLE = 'org.nabu.driver.DataBlock'
++BUNDLE_INFO = {'name': 'Nabu Data Block', 'executable': 'NabuDataBlock',
++               'path': '/System/Library/Extensions/NabuDataBlock.kext',
++               'start': '_nabu_data_block_start'}
+ 
+ 
+ def align(value, boundary=0x4000):
+@@ -272,7 +275,9 @@
+ 
+ 
+ def link(kernel, report, reference, objects, aes_reference=None, usb_reference=None,
+-         reuse_executable_gaps=False):
++         reuse_executable_gaps=False, bundle=None, bundle_info=None):
++    bundle = bundle or BUNDLE
++    info = bundle_info or BUNDLE_INFO
+     output = bytearray(kernel)
+     image = macho(output)
+     by_segment = {s['name']: s for s in image['segments']}
+@@ -448,10 +453,10 @@
+     output[text_layout['fileoff']:text_layout['fileoff'] + len(header)] = header
+     kmod = definitions['_kmod_info']
+     metadata['_PrelinkInfoDictionary'].append({
+-        'CFBundleIdentifier': BUNDLE, 'CFBundleName': 'Nabu Data Block', 'CFBundleExecutable': 'NabuDataBlock',
++        'CFBundleIdentifier': bundle, 'CFBundleName': info['name'], 'CFBundleExecutable': info['executable'],
+         'CFBundlePackageType': 'KEXT', 'CFBundleVersion': '1.0', 'OSBundleCompatibleVersion': '1.0',
+-        'OSBundleRequired': 'Local-Root', '_PrelinkBundlePath': '/System/Library/Extensions/NabuDataBlock.kext',
+-        '_PrelinkExecutableRelativePath': 'NabuDataBlock', '_PrelinkExecutableLoadAddr': text_layout['va'],
++        'OSBundleRequired': 'Local-Root', '_PrelinkBundlePath': info['path'],
++        '_PrelinkExecutableRelativePath': info['executable'], '_PrelinkExecutableLoadAddr': text_layout['va'],
+         '_PrelinkExecutableSourceAddr': text_layout['va'], '_PrelinkExecutableSize': text_layout['size'],
+         '_PrelinkKmodInfo': kmod, 'OSBundleLibraries': {'com.apple.iokit.IOStorageFamily': '2.1',
+             'com.apple.kpi.iokit': '8.0', 'com.apple.kpi.libkern': '8.0', 'com.apple.kpi.mach': '8.0',
+@@ -476,8 +481,8 @@
+     output.extend(bytes(info_at - len(output)) + xml + bytes(info_size - len(xml)))
+     struct.pack_into('<4Q', output, info['command_offset'] + 24, info['va'], info_size, info_at, info_size)
+     struct.pack_into('<QQI', output, info['sections'][0]['command_offset'] + 32, info['va'], info_size, info_at)
+-    detail = {'bundle': BUNDLE, 'storage_class': storage, 'aes_class': aes, 'usb_class': usb, 'segments': layouts, 'kmod_info': kmod,
+-              'start': definitions.get('_nabu_data_block_start'),
++    detail = {'bundle': bundle, 'storage_class': storage, 'aes_class': aes, 'usb_class': usb, 'segments': layouts, 'kmod_info': kmod,
++              'start': definitions.get(info['start']),
+               'wireless_start': definitions.get('_nabu_wireless_start'),
+               'bluetooth_trial': definitions.get('_nabu_bluetooth_version_trial'),
+               'bluetooth_firmware': definitions.get('_nabu_bluetooth_load_firmware'),
+@@ -510,6 +515,12 @@
+     parser.add_argument('--reuse-executable-gaps', action='store_true',
+                         help='Place code in an unoccupied zero-filled __PLK_TEXT_EXEC gap')
+     parser.add_argument('--output', type=Path, required=True)
++    parser.add_argument('--bundle-id', default=BUNDLE)
++    parser.add_argument('--bundle-name', default=BUNDLE_INFO['name'])
++    parser.add_argument('--executable', default=BUNDLE_INFO['executable'])
++    parser.add_argument('--bundle-path', default=BUNDLE_INFO['path'])
++    parser.add_argument('--start-symbol', default=BUNDLE_INFO['start'])
++    parser.add_argument('--report-name', default='data-block-link.json')
+     args = parser.parse_args()
+     report_path = args.prelink_report or args.kernel.with_name('prelink-report.json')
+     prelink_report = json.loads(report_path.read_text())
+@@ -517,15 +528,18 @@
+                           Object(args.reference_object), [Object(p) for p in args.object],
+                           Object(args.aes_reference_object) if args.aes_reference_object else None,
+                           Object(args.usb_reference_object) if args.usb_reference_object else None,
+-                          reuse_executable_gaps=args.reuse_executable_gaps)
++                          reuse_executable_gaps=args.reuse_executable_gaps,
++                          bundle=args.bundle_id,
++                          bundle_info={'name': args.bundle_name, 'executable': args.executable,
++                                       'path': args.bundle_path, 'start': args.start_symbol})
+     args.output.mkdir(parents=True, exist_ok=True)
+     (args.output / 'kernel.native-apfs.macho').write_bytes(result)
+-    (args.output / 'data-block-link.json').write_text(json.dumps(report, indent=2) + '\n')
++    (args.output / args.report_name).write_text(json.dumps(report, indent=2) + '\n')
+     prelink_report.pop('candidate_sha256', None)
+     prelink_report.update(candidate_bytes=len(result), data_block=report,
+                           sparse_index=report['sparse_index'], runtime_qualified=False)
+-    prelink_report['components'].append(BUNDLE)
+-    prelink_report['extents'].extend({'module': BUNDLE, 'segment': name, 'va': segment['va'],
++    prelink_report['components'].append(bundle)
++    prelink_report['extents'].extend({'module': bundle, 'segment': name, 'va': segment['va'],
+                                      'size': segment['size']} for name, segment in report['segments'].items())
+     (args.output / 'prelink-report.json').write_text(json.dumps(prelink_report, indent=2) + '\n')
+     print(json.dumps(report, indent=2))

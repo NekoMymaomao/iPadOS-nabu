@@ -1,0 +1,19 @@
+name: nabu-system-disk host tests
+
+on:
+  push:
+    paths:
+      - 'nabu-system-disk/**'
+  pull_request:
+    paths:
+      - 'nabu-system-disk/**'
+  workflow_dispatch:
+
+jobs:
+  host-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and check
+        working-directory: nabu-system-disk
+        run: make check

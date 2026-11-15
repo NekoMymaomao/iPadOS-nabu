@@ -1,0 +1,153 @@
+name: nabu system disk kernel
+
+# Builds the kernel that publishes the whole 60 GiB nabu_system as one virtual
+# disk with a synthetic GPT.  Everything from the prelink tool inward is in this
+# repository; the two Apple-derived inputs are supplied per run so no macOS
+# source image is committed.
+#
+# The object swap is deliberately narrow: NabuDataBlock.o becomes
+# NabuSystemDisk.o, the kmod object and the bundle id stay untouched, because
+# NabuNativeApfs.c loads the driver by identifier
+# (OSKextLoadKextWithIdentifier("org.nabu.driver.DataBlock")).
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_kernel_url:
+        description: 'mach.development.bcm2837.unstripped from a source build (~23 MB)'
+        required: true
+      original_kernelcache_url:
+        description: 'stock kernelcache.arm64.macho, iPad7,11 16.5 20F66 (~48 MB)'
+        required: true
+      additional_bytes:
+        description: 'driver __DATA tail to reserve before linking'
+        default: '0x280000'
+
+permissions:
+  contents: read
+
+jobs:
+  kernel:
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - name: Record the build host
+        run: |
+          sw_vers
+          xcodebuild -version
+          xcrun clang --version
+          python3 --version
+
+      - name: Fetch the prelink tool
+        run: |
+          git clone --depth 1 https://github.com/UniXNU/XnuPrelink.git \
+            nabu-system-disk/vendor/src/XnuPrelink
+
+      - name: Compile the drop-in storage driver
+        run: |
+          cd nabu-system-disk
+          mkdir -p /tmp/hdr
+          tar xzf vendor/headers/EXPORT_HDRS.tgz -C /tmp/hdr
+          EXPORT_HDRS=/tmp/hdr/EXPORT_HDRS \
+          IOKIT_STORAGE_INC="$PWD/vendor/headers/IOStorageFamily" \
+          NABU_STORAGE_INC="$PWD/vendor/patches/nabu-storage" \
+          OUT=/tmp/obj ./kext/compile_check.sh
+
+      - name: Fetch the two kernel inputs
+        run: |
+          curl -fL --retry 3 --retry-delay 5 -o /tmp/base.macho "${{ inputs.base_kernel_url }}"
+          curl -fL --retry 3 --retry-delay 5 -o /tmp/original.macho "${{ inputs.original_kernelcache_url }}"
+          ls -l /tmp/base.macho /tmp/original.macho
+          shasum -a 256 /tmp/base.macho /tmp/original.macho
+
+      - name: Prelink the stock APFS, USB and FairPlay closure
+        run: |
+          cd nabu-system-disk/vendor
+          python3 tools/build_nabu_apfs_prelink.py \
+            --kernel /tmp/base.macho \
+            --original /tmp/original.macho \
+            --output /tmp/prelink \
+            --apple-usb --fairplay
+
+      - name: Reserve the driver DATA tail
+        run: |
+          cd nabu-system-disk/vendor
+          python3 tools/extend_nabu_driver_data.py \
+            --kernel /tmp/prelink/kernel.native-apfs.macho \
+            --additional-bytes "${{ inputs.additional_bytes }}" \
+            --output /tmp/extended
+
+      - name: Swap the driver object and relink
+        run: |
+          cd nabu-system-disk/vendor
+          python3 tools/relink.py \
+            --kernel /tmp/extended/kernel.native-apfs.macho \
+            --prelink-report /tmp/extended/prelink-report.json \
+            --output /tmp/linked \
+            --replace NabuDataBlock.o=/tmp/obj/NabuSystemDisk.o
+
+      - name: Verify the image
+        run: |
+          python3 - <<'PY'
+          import json, sys
+          from pathlib import Path
+          sys.path.insert(0, 'nabu-system-disk/vendor/src/XnuPrelink')
+          from native_prelink import macho, unserialize_xml
+
+          kernel = Path('/tmp/linked/kernel.native-apfs.macho')
+          data = kernel.read_bytes()
+          report = json.loads(Path('/tmp/linked/prelink-report.json').read_text())
+          checks = []
+
+          checks.append(('published size matches the report',
+                         len(data) == report['candidate_bytes']))
+          checks.append(('NABU SYSTEM DISK log present',
+                         b'NABU SYSTEM DISK: %llu bytes' in data))
+          checks.append(('synthetic GPT descriptor present',
+                         b'60 GiB nabu_system, synthetic GPT' in data))
+          checks.append(('bundle id preserved',
+                         b'org.nabu.driver.DataBlock' in data))
+          checks.append(('old window-only driver gone',
+                         b'NABU DATA BLOCK: %s bytes' not in data))
+
+          parsed = macho(data)
+          names = {s['name'] for s in parsed['segments'] if s['size']}
+          for need in ('__TEXT', '__TEXT_EXEC', '__PRELINK_DATA', '__PRELINK_INFO'):
+              checks.append((f'{need} present', need in names))
+          info = next(s for s in parsed['segments'] if s['name'] == '__PRELINK_INFO')
+          xml = data[info['fileoff']:info['fileoff'] + info['filesize']].rstrip(b'\x00')
+          checks.append(('__PRELINK_INFO parses', isinstance(unserialize_xml(xml), dict)))
+
+          db = report.get('data_block', {})
+          checks.append(('relinked component is the storage driver',
+                         db.get('bundle') == 'org.nabu.driver.DataBlock'))
+          checks.append(('driver has a start address', bool(db.get('start'))))
+
+          failed = 0
+          for name, ok in checks:
+              print(('  PASS  ' if ok else '  FAIL  ') + name)
+              failed += 0 if ok else 1
+          print(f'\n{len(data)} bytes, {len(checks) - failed}/{len(checks)} checks passed')
+          sys.exit(1 if failed else 0)
+          PY
+
+      - name: Retain the kernel and reports
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: nabu-system-disk-kernel-${{ github.run_number }}
+          path: |
+            /tmp/linked/kernel.native-apfs.macho
+            /tmp/linked/prelink-report.json
+            /tmp/linked/data-block-link.json
+            /tmp/extended/prelink-report.json
+            /tmp/prelink/prelink-report.json
+            /tmp/obj/NabuSystemDisk.o
+          retention-days: 30
+          if-no-files-found: error
