@@ -1,9 +1,10 @@
 #!/bin/sh
-# Cross-compile the driver for the 8796 kernel ABI (arm64, iOS 16.5).
+# Cross-compile the drop-in storage driver for the 8796 kernel ABI.
 #
-# This is the same target/flags as build_nabu_system_disk.py; it exists so the
-# sources can be compile-checked on a Linux host (or CI) without xcrun.  It does
-# not replace the macOS build: the prelink step still needs a macOS toolchain.
+# Produces ONE object, src/NabuSystemDisk.cpp (the routing engine in
+# NabuDiskCore.cpp is compiled into the same translation unit), which replaces
+# NabuDataBlock.o in the existing prelink object list.  The kmod object is
+# unchanged, so the bundle id stays org.nabu.driver.DataBlock.
 #
 # Required:
 #   EXPORT_HDRS          an exported kernel header set (osfmk/bsd/libkern/...)
@@ -28,27 +29,21 @@ for d in osfmk bsd libkern pexpert iokit security san; do
 done
 [ -n "${XNU_EXTERNAL_HEADERS:-}" ] && inc="$inc -I$XNU_EXTERNAL_HEADERS"
 
-compile() {
-    # shellcheck disable=SC2086
-    clang++ -target arm64-apple-ios16.5 -std=gnu++17 -Os -mkernel -fapple-kext \
-        -fno-exceptions -fno-rtti -fno-builtin -fno-stack-protector \
-        -fno-unwind-tables -fno-asynchronous-unwind-tables \
-        -nostdinc -nostdinc++ -DKERNEL=1 -D__DARWIN_64_BIT_INO_T=1 \
-        -DARM64_BOARD_CONFIG_BCM2837 -DXNU_TARGET_OS_IOS=1 \
-        -Wno-deprecated-declarations -Wno-inconsistent-missing-override \
-        -I"$IOKIT_STORAGE_INC" -I"$NABU_STORAGE_INC" -I"$here/src" $inc \
-        -c "$1" -o "$2"
-}
+# shellcheck disable=SC2086
+clang++ -target arm64-apple-ios16.5 -std=gnu++17 -Os -g -mkernel -fapple-kext \
+    -fno-exceptions -fno-rtti -fno-builtin -fno-stack-protector \
+    -fno-unwind-tables -fno-asynchronous-unwind-tables \
+    -nostdinc -nostdinc++ -DKERNEL=1 -D__DARWIN_64_BIT_INO_T=1 \
+    -DARM64_BOARD_CONFIG_BCM2837 -DXNU_TARGET_OS_IOS=1 \
+    -Wno-deprecated-declarations -Wno-inconsistent-missing-override \
+    -I"$IOKIT_STORAGE_INC" -I"$NABU_STORAGE_INC" -I"$here/src" $inc \
+    -c "$here/src/NabuSystemDisk.cpp" -o "$out/NabuSystemDisk.o"
 
-compile "$here/src/NabuDiskCore.cpp"       "$out/NabuDiskCore.o"
-compile "$here/src/NabuSystemDisk.cpp"     "$out/NabuSystemDisk.o"
-compile "$here/kext/NabuSystemDiskKmod.cpp" "$out/NabuSystemDiskKmod.o"
-
-for f in "$out"/*.o; do
-    file "$f"
-done
-printf '%s\n' "kmod symbols:"
+file "$out/NabuSystemDisk.o"
 if command -v llvm-nm >/dev/null 2>&1; then nm_tool=llvm-nm
 elif command -v llvm-nm-18 >/dev/null 2>&1; then nm_tool=llvm-nm-18
 else nm_tool=nm; fi
-"$nm_tool" "$out/NabuSystemDiskKmod.o" | grep -E '_kmod_info|_nabu_system_disk_start' || true
+printf '%s\n' "defined:"
+"$nm_tool" --defined-only "$out/NabuSystemDisk.o" | grep -E '_nabu_data_block_start|NabuSystemDisk' | head -8 || true
+printf '%s\n' "undefined (resolved by the existing prelink graph):"
+"$nm_tool" -u "$out/NabuSystemDisk.o" | head -20 || true
