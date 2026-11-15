@@ -13,7 +13,11 @@
 // for byte against tools/gen_gpt.py.
 #include <stdint.h>
 #include <stddef.h>
+#if defined(KERNEL)
+#include <libkern/libkern.h>     // memcpy/memset live here inside the kernel
+#else
 #include <string.h>
+#endif
 
 namespace nabu {
 

@@ -38,6 +38,20 @@ Defaults are unchanged, so the existing DataBlock build keeps working; the new
 flags are `--bundle-id --bundle-name --executable --bundle-path --start-symbol
 --report-name`.
 
+### Compile check without macOS
+
+`kext/compile_check.sh` runs the same flags against an `EXPORT_HDRS` tree and the
+IOStorageFamily headers, so a Linux host can verify the sources still target the
+kernel ABI:
+
+```sh
+EXPORT_HDRS=<tree>/EXPORT_HDRS \
+IOKIT_STORAGE_INC=<include with IOKit/storage + TargetConditionals.h> \
+NABU_STORAGE_INC=<nabu-storage headers> \
+XNU_EXTERNAL_HEADERS=<xnu>/EXTERNAL_HEADERS \
+./kext/compile_check.sh
+```
+
 ## 3. Prelink
 
 ```sh
@@ -71,5 +85,5 @@ for `nabu-system-disk=0` A/B boots.
 | step | verified by |
 |---|---|
 | GPT bytes, routing, read/write semantics | `make check` on Linux, and GitHub Actions |
-| C++ compiles for arm64 iOS kernel | `build_nabu_system_disk.py` on macOS (not run in this sandbox) |
+| C++ compiles for arm64 iOS kernel | `kext/compile_check.sh`: all three objects build as `Mach-O 64-bit arm64`, `_kmod_info` defined, `_nabu_system_disk_start` left as an import |
 | prelink and boot | must run on the macOS build host + device |

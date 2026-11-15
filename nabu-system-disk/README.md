@@ -98,6 +98,12 @@ test drives a fake transport and asserts content, routing, refusals, GPT write
 shadowing, boundary crossings, and that a 128 KiB request stays one transport
 call.
 
+`kext/compile_check.sh` additionally cross-compiles the three kernel sources with
+`-target arm64-apple-ios16.5 -mkernel -fapple-kext` against an exported 8796
+header set: all three produce `Mach-O 64-bit arm64` objects, `_kmod_info` is
+defined, and `_nabu_system_disk_start` is left as the import the prelink step
+resolves.
+
 ## Integration (kernel side)
 
 1. Call `nabu_system_disk_start()` after `nabu_storage_prepare()` has validated

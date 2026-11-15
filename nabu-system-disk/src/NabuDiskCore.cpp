@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 #include "NabuDiskCore.h"
 
+#if defined(KERNEL)
+#include <libkern/libkern.h>
+#else
 #include <string.h>
+#endif
 
 namespace nabu {
 
