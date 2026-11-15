@@ -29,8 +29,40 @@ for d in osfmk bsd libkern pexpert iokit security san; do
 done
 [ -n "${XNU_EXTERNAL_HEADERS:-}" ] && inc="$inc -I$XNU_EXTERNAL_HEADERS"
 
+# clang's own <stdarg.h>, <stdint.h>, <stddef.h> live in its resource directory,
+# which -nostdinc removes along with the system paths.  Put it back explicitly,
+# otherwise a hosted toolchain build dies on 'stdarg.h' file not found.
+builtin_inc=$("${CXX:-clang++}" -print-resource-dir)/include
+[ -d "$builtin_inc" ] && inc="$inc -isystem $builtin_inc"
+
+# Prefer the iOS SDK as sysroot; falling back to the host SDK only produces a
+# warning when the target is arm64-apple-ios.
+sdk="${IPHONEOS_SDK:-}"
+if [ -z "$sdk" ] && command -v xcrun >/dev/null 2>&1; then
+    sdk=$(xcrun --sdk iphoneos --show-sdk-path 2>/dev/null || true)
+fi
+sysroot=""
+[ -n "$sdk" ] && [ -d "$sdk" ] && sysroot="-isysroot $sdk"
+# -nostdinc also drops the sysroot's own usr/include, so name it explicitly.
+# The EXPORT_HDRS trees are -I and therefore still win the lookup.
+if [ -n "$sysroot" ] && [ -d "$sdk/usr/include" ]; then
+    inc="$inc -isystem $sdk/usr/include"
+fi
+
+# The storage headers are kept flat so they can be diffed; the driver includes
+# them as <IOKit/storage/...>, so mirror them into that shape.
+if [ -d "$IOKIT_STORAGE_INC" ] && [ ! -d "$IOKIT_STORAGE_INC/IOKit/storage" ]; then
+    shim="$out/shim"
+    mkdir -p "$shim/IOKit/storage"
+    for h in "$IOKIT_STORAGE_INC"/*.h; do
+        [ -e "$h" ] && cp -f "$h" "$shim/IOKit/storage/"
+    done
+    inc="$inc -I$shim"
+fi
+
 # shellcheck disable=SC2086
 clang++ -target arm64-apple-ios16.5 -std=gnu++17 -Os -g -mkernel -fapple-kext \
+    $sysroot \
     -fno-exceptions -fno-rtti -fno-builtin -fno-stack-protector \
     -fno-unwind-tables -fno-asynchronous-unwind-tables \
     -nostdinc -nostdinc++ -DKERNEL=1 -D__DARWIN_64_BIT_INO_T=1 \
