@@ -3,10 +3,10 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-// Call after the original IOStorageFamily has registered its classes and
-// after nabu_storage_prepare() has validated OS/SystemOS.  Publishes the
-// whole 60 GiB nabu_system as one virtual disk with a synthetic GPT.
-int nabu_system_disk_start(void);
+// Drop-in replacement for NabuDataBlock.h.  Same symbol the kmod calls and the
+// same bundle id NabuNativeApfs.c loads, but the published device is the whole
+// 60 GiB nabu_system with a synthetic GPT instead of the bare Data window.
+int nabu_data_block_start(void);
 #ifdef __cplusplus
 }
 #endif
