@@ -195,24 +195,23 @@ static inline void buildProtectiveMbr(uint8_t *out)
 }
 
 // Build the whole metadata blob (kMetaBytes).
+//
+// The blob is assembled in place inside the caller's buffer.  Keeping the two
+// 16 KiB entry arrays off the stack matters: a 32 KiB frame makes clang emit a
+// call to ___chkstk_darwin, which the prelinked kernel does not export, so the
+// relink fails on that symbol.
 static inline void buildMetadata(uint8_t *out)
 {
-    uint8_t entries[kEntryBytes];
-    buildEntries(entries);
-    uint8_t backupEntries[kEntryBytes];
-    memcpy(backupEntries, entries, kEntryBytes);
+    uint8_t *primary = out + kMbrBytes;
+    uint8_t *entries = primary + kHeaderBytes;
+    uint8_t *backupEntries = entries + kEntryBytes;
+    uint8_t *backup = backupEntries + kEntryBytes;
 
-    uint8_t primary[kHeaderBytes];
-    uint8_t backup[kHeaderBytes];
+    buildProtectiveMbr(out);
+    buildEntries(entries);
+    memcpy(backupEntries, entries, kEntryBytes);
     buildHeader(primary, 1, kBackupHeaderLba, kEntryLba, entries);
     buildHeader(backup, kBackupHeaderLba, 1, kBackupEntryLba, entries);
-
-    uint8_t *p = out;
-    buildProtectiveMbr(p); p += kMbrBytes;
-    memcpy(p, primary, kHeaderBytes); p += kHeaderBytes;
-    memcpy(p, entries, kEntryBytes); p += kEntryBytes;
-    memcpy(p, backupEntries, kEntryBytes); p += kEntryBytes;
-    memcpy(p, backup, kHeaderBytes);
 }
 
 // If [lba, lba+sectors) touches synthetic metadata, return the number of

@@ -79,3 +79,13 @@ printf '%s\n' "defined:"
 "$nm_tool" --defined-only "$out/NabuSystemDisk.o" | grep -E '_nabu_data_block_start|NabuSystemDisk' | head -8 || true
 printf '%s\n' "undefined (resolved by the existing prelink graph):"
 "$nm_tool" -u "$out/NabuSystemDisk.o" | head -20 || true
+
+# The prelinked kernel exports no stack-probe helper.  A large stack frame makes
+# clang call ___chkstk_darwin, which the relink then cannot resolve -- catch it
+# here instead of at the end of the pipeline.
+if "$nm_tool" -u "$out/NabuSystemDisk.o" | grep -q '__chkstk_darwin'; then
+    printf '%s\n' \
+        "error: object calls ___chkstk_darwin; a stack frame is too large." \
+        "       Move big buffers out of locals (see nabu::buildMetadata)." >&2
+    exit 1
+fi
